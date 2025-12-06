@@ -641,10 +641,49 @@ void CXWM::handleSelectionNotify(xcb_selection_notify_event_t* e) {
         getTransferData(*sel);
 }
 
+void CXWM::sendIncrChunk(SXSelection& sel, SXTransfer& transfer) {
+    auto conn = getConnection();
+    
+    // INCR protocol (ICCCM 2.7.2): Send data in chunks when it exceeds the max property size.
+    // The client signals readiness for the next chunk by deleting the property.
+    // We send chunks until all data is transferred, then send a zero-length property to signal completion.
+    
+    size_t remaining = transfer.data.size() - transfer.propertyStart;
+    size_t chunkSize = std::min(remaining, INCR_CHUNK_SIZE);
+    
+    Debug::log(LOG, "[xwm] Sending INCR chunk: offset={}, chunk={}, remaining={}", 
+               transfer.propertyStart, chunkSize, remaining);
+    
+    if (chunkSize > 0) {
+        // Send the next chunk of data
+        xcb_change_property(conn, XCB_PROP_MODE_REPLACE, transfer.request.requestor,
+                          transfer.request.property, transfer.request.target, 8,
+                          chunkSize, transfer.data.data() + transfer.propertyStart);
+        
+        transfer.propertyStart += chunkSize;
+        xcb_flush(conn);
+    } else {
+        // All data sent - send zero-length property to signal transfer completion per ICCCM
+        Debug::log(LOG, "[xwm] INCR transfer complete, sending termination signal");
+        xcb_change_property(conn, XCB_PROP_MODE_REPLACE, transfer.request.requestor,
+                          transfer.request.property, transfer.request.target, 8, 0, nullptr);
+        xcb_flush(conn);
+        
+        // Clean up the completed transfer
+        auto it = std::ranges::find_if(sel.transfers, [&transfer](const auto& t) { 
+            return t.get() == &transfer; 
+        });
+        if (it != sel.transfers.end()) {
+            sel.transfers.erase(it);
+        }
+    }
+}
+
 bool CXWM::handleSelectionPropertyNotify(xcb_property_notify_event_t* e) {
     if (e->state != XCB_PROPERTY_DELETE)
         return false;
 
+    // Handle incoming INCR transfers (from X11 to Wayland)
     for (auto* sel : {&m_clipboard, &m_primarySelection}) {
         auto it = std::ranges::find_if(sel->transfers, [e](const auto& t) { return t->incomingWindow == e->window; });
         if (it != sel->transfers.end()) {
@@ -653,6 +692,20 @@ bool CXWM::handleSelectionPropertyNotify(xcb_property_notify_event_t* e) {
                 return false;
             }
             getTransferData(*sel);
+            return true;
+        }
+    }
+
+    // Handle outgoing INCR transfers (from Wayland to X11)
+    // When X11 client deletes the property, it signals it has consumed the data
+    for (auto* sel : {&m_clipboard, &m_primarySelection}) {
+        auto it = std::ranges::find_if(sel->transfers, [e](const auto& t) { 
+            return t->incremental && t->out && t->request.requestor == e->window && 
+                   t->request.property == e->atom;
+        });
+        
+        if (it != sel->transfers.end()) {
+            sendIncrChunk(*sel, **it);
             return true;
         }
     }
@@ -1461,12 +1514,39 @@ int SXSelection::onRead(int fd, uint32_t mask) {
 
         Debug::log(LOG, "[xwm] Transfer complete, total size: {}", transfer->data.size());
         auto conn = g_pXWayland->m_wm->getConnection();
-        xcb_change_property(conn, XCB_PROP_MODE_REPLACE, transfer->request.requestor, transfer->request.property, transfer->request.target, 8, transfer->data.size(),
-                            transfer->data.data());
-
-        xcb_flush(conn);
-        g_pXWayland->m_wm->selectionSendNotify(&transfer->request, true);
-        transfers.erase(it);
+        
+        // ICCCM 2.7.2: Use INCR protocol for transfers exceeding the maximum property size.
+        // XCB has a practical limit of 65535 bytes for selection transfers via properties.
+        constexpr size_t MAX_DIRECT_SIZE = 65535;
+        if (transfer->data.size() > MAX_DIRECT_SIZE) {
+            Debug::log(LOG, "[xwm] Using INCR protocol for large transfer ({} bytes)", transfer->data.size());
+            
+            // Step 1: Initiate INCR transfer by setting property type to INCR with total data size
+            transfer->incremental = true;
+            transfer->propertySet = false;
+            transfer->propertyStart = 0;
+            
+            uint32_t totalSize = transfer->data.size();
+            xcb_change_property(conn, XCB_PROP_MODE_REPLACE, transfer->request.requestor, 
+                              transfer->request.property, HYPRATOMS["INCR"], 32, 1, &totalSize);
+            
+            xcb_flush(conn);
+            // Step 2: Send SelectionNotify to inform client that INCR transfer is starting
+            g_pXWayland->m_wm->selectionSendNotify(&transfer->request, true);
+            
+            // Step 3: Chunks will be sent via PropertyNotify(Delete) events in sendIncrChunk()
+            // PropertyNotify events are received because XCB_EVENT_MASK_PROPERTY_CHANGE is set on root
+            // Keep transfer alive for incremental sending - don't erase yet
+        } else {
+            // Small transfer: send all data directly in one property change
+            xcb_change_property(conn, XCB_PROP_MODE_REPLACE, transfer->request.requestor, 
+                              transfer->request.property, transfer->request.target, 8, 
+                              transfer->data.size(), transfer->data.data());
+            
+            xcb_flush(conn);
+            g_pXWayland->m_wm->selectionSendNotify(&transfer->request, true);
+            transfers.erase(it);
+        }
     } else
         Debug::log(LOG, "[xwm] Received {} bytes, awaiting more...", bytesRead);
 

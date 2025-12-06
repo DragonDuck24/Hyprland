@@ -171,6 +171,7 @@ class CXWM {
     bool         handleSelectionXFixesNotify(xcb_xfixes_selection_notify_event_t* e);
 
     void         selectionSendNotify(xcb_selection_request_event_t* e, bool success);
+    void         sendIncrChunk(SXSelection& sel, SXTransfer& transfer);
     xcb_atom_t   mimeToAtom(const std::string& mime);
     std::string  mimeFromAtom(xcb_atom_t atom);
     void         setClipboardToWayland(SXSelection& sel);

@@ -26,9 +26,11 @@ using Hyprutils::Memory::CUniquePointer;
 using namespace Hyprutils::OS;
 
 #define XCB_EVENT_RESPONSE_TYPE_MASK 0x7f
-constexpr size_t   INCR_CHUNK_SIZE        = 64ul * 1024;
-constexpr size_t   XCB_MAX_PROPERTY_SIZE  = 65535;      // Maximum size for direct property transfer
-constexpr uint32_t XCB_MAX_INCR_DATA_SIZE = UINT32_MAX; // INCR property size is 32-bit
+constexpr size_t INCR_CHUNK_SIZE = 64ul * 1024;
+// Maximum size for direct (non-INCR) X11 property transfer per ICCCM.
+// Properties can technically hold more data, but selection transfers are limited to this size.
+constexpr size_t   XCB_MAX_PROPERTY_SIZE  = 65535;
+constexpr uint32_t XCB_MAX_INCR_DATA_SIZE = UINT32_MAX; // INCR property size field is 32-bit
 
 static int         onX11Event(int fd, uint32_t mask, void* data) {
     return g_pXWayland->m_wm->onEvent(fd, mask);

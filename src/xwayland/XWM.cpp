@@ -26,9 +26,11 @@ using Hyprutils::Memory::CUniquePointer;
 using namespace Hyprutils::OS;
 
 #define XCB_EVENT_RESPONSE_TYPE_MASK 0x7f
-constexpr size_t INCR_CHUNK_SIZE = 64ul * 1024;
+constexpr size_t   INCR_CHUNK_SIZE        = 64ul * 1024;
+constexpr size_t   XCB_MAX_PROPERTY_SIZE  = 65535;      // Maximum size for direct property transfer
+constexpr uint32_t XCB_MAX_INCR_DATA_SIZE = UINT32_MAX; // INCR property size is 32-bit
 
-static int       onX11Event(int fd, uint32_t mask, void* data) {
+static int         onX11Event(int fd, uint32_t mask, void* data) {
     return g_pXWayland->m_wm->onEvent(fd, mask);
 }
 
@@ -1510,8 +1512,15 @@ int SXSelection::onRead(int fd, uint32_t mask) {
 
         // ICCCM 2.7.2: Use INCR protocol for transfers exceeding the maximum property size.
         // XCB has a practical limit of 65535 bytes for selection transfers via properties.
-        constexpr size_t MAX_DIRECT_SIZE = 65535;
-        if (transfer->data.size() > MAX_DIRECT_SIZE) {
+        if (transfer->data.size() > XCB_MAX_PROPERTY_SIZE) {
+            // Check if data size exceeds INCR protocol limits (INCR uses 32-bit size)
+            if (transfer->data.size() > XCB_MAX_INCR_DATA_SIZE) {
+                Debug::log(ERR, "[xwm] Transfer size {} exceeds INCR protocol maximum of {} bytes", transfer->data.size(), XCB_MAX_INCR_DATA_SIZE);
+                g_pXWayland->m_wm->selectionSendNotify(&transfer->request, false);
+                transfers.erase(it);
+                return 0;
+            }
+
             Debug::log(LOG, "[xwm] Using INCR protocol for large transfer ({} bytes)", transfer->data.size());
 
             // Step 1: Initiate INCR transfer by setting property type to INCR with total data size
@@ -1519,7 +1528,7 @@ int SXSelection::onRead(int fd, uint32_t mask) {
             transfer->propertySet   = false;
             transfer->propertyStart = 0;
 
-            uint32_t totalSize = transfer->data.size();
+            uint32_t totalSize = static_cast<uint32_t>(transfer->data.size());
             xcb_change_property(conn, XCB_PROP_MODE_REPLACE, transfer->request.requestor, transfer->request.property, HYPRATOMS["INCR"], 32, 1, &totalSize);
 
             xcb_flush(conn);
